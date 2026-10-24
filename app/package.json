@@ -5,12 +5,17 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "tsc --noEmit && vite build --mode development",
+    "build:android-dev": "tsc --noEmit && vite build --mode android-dev",
+    "build:production": "tsc --noEmit && vite build --mode production && node scripts/assert-web-build.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "cap:sync": "cap sync android",
+    "cap:sync:dev": "node -e \"if(process.env.CAPACITOR_DEV_HTTP!=='1')throw new Error('Set CAPACITOR_DEV_HTTP=1 explicitly for the local HTTP bridge')\" && npm run build:android-dev && cap sync android",
+    "cap:sync:production": "node scripts/assert-android-release.mjs --before-sync && npm run build:production && cap sync android && node scripts/assert-android-release.mjs",
+    "test:api-config": "node --test config/api-environment.test.mjs",
     "apk:debug": "cd android && ./gradlew assembleDebug",
-    "apk:release": "cd android && ./gradlew assembleRelease"
+    "apk:release": "npm run cap:sync:production && cd android && ./gradlew assembleRelease"
   },
   "dependencies": {
     "@capacitor-community/sqlite": "^8.1.1",
