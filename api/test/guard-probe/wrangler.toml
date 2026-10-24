@@ -1,0 +1,10 @@
+name = "guard-probe"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# Probe-only D1 binding. Only ever used with `wrangler dev --local` and an
+# isolated --persist-to directory. Never bind or touch a remote database.
+[[d1_databases]]
+binding = "DB"
+database_name = "guard-probe-db"
+database_id = "local-probe-only"
