@@ -1,51 +1,61 @@
 /**
- * In-memory app state (阶段 2 baseline).
+ * 应用状态（阶段 3：本地优先 + 最小自动同步）。
  *
- * IMPORTANT — temporary-data boundary:
- * Nothing here is persisted. No SQLite, no localStorage, no outbox, no sync
- * engine (those are 阶段 3). Every mutation below calls the real backend
- * synchronously; if the network call fails, the state is not changed and the
- * error is surfaced. Reopening the app always requires login again.
+ * 打卡/补录/编辑先写本地 SQLite（同一事务入队），UI 立即反馈；同步由
+ * sync.ts 在启动、回到前台、网络恢复、手动点击时串行推送并增量拉取。
+ * 失败绝不清空本地数据。
  */
 import { useEffect, useState } from 'preact/compat';
-import { api, ApiError, getAuthToken, setAuthToken, type SessionView } from './api.js';
+import { api, ApiError, setAuthToken } from './api.js';
+import {
+  addBackfill,
+  countPendingOps,
+  editLocal,
+  getMeta,
+  getOpenSleep,
+  initLocal,
+  isPersistent,
+  isReady,
+  listSessions,
+  recordSleep,
+  recordWake,
+  setMeta,
+  storageErrorMessage,
+  type LocalSession,
+  type WriteFailure,
+} from './local.js';
+import { loadToken, storeToken } from './secure-token.js';
+import { getSyncSnapshot, manualSync, onSyncChange, requestSync, setUnauthorizedHandler, type SyncSnapshot } from './sync.js';
 
 export type PunchStatus =
   | { kind: 'signed_out' }
-  | { kind: 'idle' } // no open sleep event
-  | { kind: 'open_sleep'; occurredAt: string } // 已点击睡了，等待醒了
-  | { kind: 'syncing' } // 正在调用后端
-  | { kind: 'error'; message: string; code: string };
-
-export type ConflictState = {
-  sessionId: string;
-  message: string;
-  serverSession: SessionView | null;
-  retry: () => Promise<void>;
-} | null;
+  | { kind: 'idle' }
+  | { kind: 'open_sleep'; occurredAt: string }
+  | { kind: 'busy' }
+  | { kind: 'storage_error'; message: string };
 
 type Store = {
   signedIn: boolean;
   status: PunchStatus;
-  sessions: SessionView[];
-  pendingWarning: string | null;
-  conflict: ConflictState;
+  sessions: LocalSession[];
   lastResult: string | null;
+  storageNote: string | null;
+  sync: SyncSnapshot;
 };
 
-let store: Store = {
-  signedIn: getAuthToken() !== null,
-  status: getAuthToken() !== null ? { kind: 'idle' } : { kind: 'signed_out' },
+const store: Store = {
+  signedIn: false,
+  status: { kind: 'signed_out' },
   sessions: [],
-  pendingWarning: null,
-  conflict: null,
   lastResult: null,
+  storageNote: null,
+  sync: getSyncSnapshot(),
 };
 
 const listeners = new Set<() => void>();
 
 function set(patch: Partial<Store>): void {
-  store = { ...store, ...patch };
+  Object.assign(store, patch);
   for (const l of listeners) l();
 }
 
@@ -54,214 +64,224 @@ export function useStore(): Store {
   useEffect(() => {
     const listener = () => force((n) => n + 1);
     listeners.add(listener);
+    const unsubSync = onSyncChange((s) => {
+      set({ sync: s });
+      // 同步会改写本地行（临时配对 → 正式记录），结束后必须重新读库，
+      // 否则历史页一直停留在同步前的快照。
+      if (s.phase !== 'running') void reloadFromLocal();
+    });
     return () => {
       listeners.delete(listener);
+      unsubSync();
     };
   }, []);
   return store;
 }
 
-const uuid = () =>
-  typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : // 运行时环境若无 randomUUID（非安全上下文），回退手动拼装 v4。
-      'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (ch) => {
-        const r = (Math.random() * 16) | 0;
-        const v = ch === 'x' ? r : (r & 0x3) | 0x8;
-        return v.toString(16);
-      });
+const FAILURE_TEXT: Record<WriteFailure, string> = {
+  SLEEP_ALREADY_OPEN: '已有一条未配对的入睡记录，请先点「醒了」',
+  NO_OPEN_SLEEP: '当前没有待配对的入睡记录，请先点「睡了」',
+  INVALID_INTERVAL: '时间无效：结束时间必须晚于开始时间',
+  SESSION_OVERLAP: '该时间段与已有记录重叠，未保存',
+  INVALID_QUALITY: '质量只接受 1–5 的整数（留空表示清除）',
+  NOT_FOUND: '记录不存在',
+};
+
+function localWriteError(f: WriteFailure): void {
+  set({ lastResult: FAILURE_TEXT[f] });
+}
+
+/** 启动：初始化本地存储 → 恢复 token → 校验数据归属 → 触发同步。 */
+export async function bootstrap(): Promise<void> {
+  const err = await initLocal();
+  set({ storageNote: err });
+  const token = await loadToken();
+  if (token !== null) {
+    setAuthToken(token);
+    set({ signedIn: true });
+  }
+  await reloadFromLocal();
+  if (store.signedIn) void requestSync('启动');
+}
+
+async function reloadFromLocal(): Promise<void> {
+  if (!isReady()) return;
+  const [open, sessions] = await Promise.all([getOpenSleep(), listSessions()]);
+  set({
+    status: store.signedIn
+      ? open !== null
+        ? { kind: 'open_sleep', occurredAt: open.occurred_at }
+        : { kind: 'idle' }
+      : { kind: 'signed_out' },
+    sessions,
+  });
+}
+
+/** 同步完成后刷新展示。 */
+async function afterSyncRefresh(): Promise<void> {
+  await reloadFromLocal();
+}
 
 export async function login(email: string, password: string): Promise<string | null> {
+  if (!isReady()) return storageErrorMessage() ?? '本地存储不可用';
   try {
     const res = await api.login(email, password);
+    // 数据归属守卫：本地已有别的账号的数据时阻止串号。
+    const owner = await getMeta('owner.user_id');
+    if (owner !== null && owner !== res.user.id) {
+      const pending = await countPendingOps();
+      if (pending > 0) {
+        return `本机还有 ${pending} 条属于原账号的待同步记录，请先同步或回到原账号`;
+      }
+      // 无待推送数据 → 提示后清空旧数据再接新账号（MVP：直接清）。
+      const { clearLocalData } = await import('./local.js');
+      await clearLocalData();
+    }
+    await setMeta('owner.user_id', res.user.id);
+    await setMeta('owner.email', res.user.email);
     setAuthToken(res.token);
-    set({ signedIn: true, status: { kind: 'idle' } });
-    await Promise.all([refreshSessions(), refreshPending()]);
+    await storeToken(res.token);
+    set({ signedIn: true, lastResult: null });
+    await reloadFromLocal();
+    void requestSync('登录');
     return null;
   } catch (e) {
-    return e instanceof ApiError ? e.message : 'Network error';
+    if (e instanceof ApiError) return e.status === 401 ? '邮箱或密码不正确' : e.message;
+    return '无法连接服务器，请检查网络后重试';
   }
 }
 
 export async function logout(): Promise<void> {
   try {
-    await api.logout(); // revokes the server-side session (阶段 1 contract)
+    await api.logout();
   } catch {
-    /* even if the call fails, drop the in-memory token */
+    /* 断网退出：token 本地清除即可，数据全部保留 */
   }
   setAuthToken(null);
-  set({
-    signedIn: false,
-    status: { kind: 'signed_out' },
-    sessions: [],
-    pendingWarning: null,
-    conflict: null,
-    lastResult: null,
-  });
+  await storeToken(null);
+  set({ signedIn: false, status: { kind: 'signed_out' }, sessions: [], lastResult: null });
 }
 
-export async function refreshPending(): Promise<void> {
-  if (!store.signedIn) return;
-  try {
-    const res = await api.getPending();
-    const open = res.events.find((e) => e.event_type === 'sleep' && e.session_id === null);
-    set({
-      pendingWarning: res.warning,
-      status: open
-        ? { kind: 'open_sleep', occurredAt: open.occurred_at }
-        : store.status.kind === 'open_sleep'
-          ? { kind: 'idle' }
-          : store.status,
-    });
-  } catch (e) {
-    if (e instanceof ApiError && e.status === 401) {
-      set({ signedIn: false, status: { kind: 'signed_out' } });
-    }
-  }
+export async function refreshStatus(): Promise<void> {
+  await reloadFromLocal();
+  if (store.signedIn) void requestSync('刷新');
 }
 
-export async function refreshSessions(): Promise<void> {
-  if (!store.signedIn) return;
-  try {
-    const res = await api.getSessions();
-    set({ sessions: res.sessions.slice().sort((a, b) => (a.start_at < b.start_at ? 1 : -1)) });
-  } catch {
-    /* keep previous list; error surfaces via punch flows */
-  }
+export async function syncNow(): Promise<void> {
+  await manualSync();
+  await afterSyncRefresh();
+}
+
+function storageHint(): string {
+  return isPersistent() ? '已保存到本地' : '已保存（浏览器内存，重启丢失）';
 }
 
 export async function punchSleep(): Promise<void> {
-  set({ status: { kind: 'syncing' }, lastResult: null });
-  try {
-    const res = await api.postEvent(uuid(), 'sleep', new Date().toISOString());
-    set({
-      status:
-        res.status === 'open'
-          ? { kind: 'open_sleep', occurredAt: res.event.occurred_at }
-          : { kind: 'idle' },
-      lastResult: `已记录入睡：${res.event.occurred_at}（服务端已确认）`,
-    });
-    await refreshPending();
-  } catch (e) {
-    handlePunchError(e);
+  if (!isReady()) {
+    set({ status: { kind: 'storage_error', message: storageErrorMessage() ?? '本地存储不可用' } });
+    return;
   }
+  set({ status: { kind: 'busy' }, lastResult: null });
+  try {
+    const res = await recordSleep(new Date().toISOString());
+    if (typeof res !== 'string') {
+      set({ status: { kind: 'open_sleep', occurredAt: res.occurred_at }, lastResult: '已记录入睡（' + storageHint() + '）' });
+      void requestSync('打卡');
+    } else {
+      localWriteError(res);
+      await reloadFromLocal();
+    }
+  } catch (e) {
+    set({ status: { kind: 'storage_error', message: e instanceof Error ? e.message : String(e) } });
+    await reloadFromLocal();
+  }
+  set({ sessions: await (isReady() ? listSessions() : Promise.resolve([])) });
 }
 
 export async function punchWake(): Promise<void> {
-  set({ status: { kind: 'syncing' }, lastResult: null });
+  if (!isReady()) {
+    set({ status: { kind: 'storage_error', message: storageErrorMessage() ?? '本地存储不可用' } });
+    return;
+  }
+  set({ status: { kind: 'busy' }, lastResult: null });
   try {
-    const res = await api.postEvent(uuid(), 'wake', new Date().toISOString());
-    set({
-      status: { kind: 'idle' },
-      lastResult:
-        res.session !== null
-          ? `配对成功：${res.session.duration_minutes} 分钟（服务端 session ${res.session.id.slice(0, 8)}…）`
-          : '已记录醒来',
-    });
-    await Promise.all([refreshSessions(), refreshPending()]);
+    const res = await recordWake(new Date().toISOString());
+    if (typeof res !== 'string') {
+      set({
+        status: { kind: 'idle' },
+        lastResult: `配对成功：${res.session.duration_minutes} 分钟（${storageHint()}，待同步）`,
+      });
+      void requestSync('打卡');
+    } else {
+      localWriteError(res);
+    }
   } catch (e) {
-    handlePunchError(e);
+    set({ status: { kind: 'storage_error', message: e instanceof Error ? e.message : String(e) } });
   }
+  await reloadFromLocal();
+  set({ sessions: isReady() ? await listSessions() : store.sessions });
 }
 
-function handlePunchError(e: unknown): void {
-  if (e instanceof ApiError) {
-    set({ status: { kind: 'error', message: e.message, code: e.code } });
-  } else {
-    set({ status: { kind: 'error', message: 'Network error', code: 'NETWORK' } });
-  }
-}
-
+/** 补录：返回给页面的错误文本（成功 null）。 */
 export async function backfill(
   startAt: string,
   endAt: string,
-  quality: number | null
+  quality: number | null,
 ): Promise<string | null> {
+  if (!isReady()) return storageErrorMessage() ?? '本地存储不可用';
   try {
-    const res = await api.insertSession({
-      session_id: uuid(),
-      client_op_id: uuid(),
-      start_at: startAt,
-      end_at: endAt,
-      quality,
-    });
-    await refreshSessions();
-    set({ lastResult: `补录成功：${res.session.duration_minutes} 分钟` });
-    return null;
-  } catch (e) {
-    if (e instanceof ApiError) {
-      if (e.code === 'SESSION_OVERLAP') {
-        set({
-          conflict: {
-            sessionId: 'backfill',
-            message: '补录区间与已有记录重叠',
-            serverSession: null,
-            retry: async () => undefined,
-          },
-        });
-      }
-      return `${e.code}: ${e.message}`;
+    const res = await addBackfill(startAt, endAt, quality);
+    if (typeof res !== 'string') {
+      set({ lastResult: `补录成功：${res.session.duration_minutes} 分钟（${storageHint()}，待同步）` });
+      set({ sessions: await listSessions() });
+      void requestSync('补录');
+      return null;
     }
-    return 'Network error';
+    return FAILURE_TEXT[res];
+  } catch (e) {
+    return e instanceof Error ? e.message : '保存失败';
   }
 }
 
+/** 编辑：返回给页面的错误文本（成功 null）。 */
 export async function editSession(
   id: string,
-  baseVersion: number,
-  patch: { start_at?: string; end_at?: string; quality?: number | null }
+  patch: { start_at?: string; end_at?: string; quality?: number | null },
 ): Promise<string | null> {
-  const body = { client_op_id: uuid(), base_version: baseVersion, ...patch };
-  const retry = async () => {
-    await editSessionDirect(id, { ...body });
-  };
+  if (!isReady()) return storageErrorMessage() ?? '本地存储不可用';
   try {
-    const res = await editSessionDirect(id, body);
-    await refreshSessions();
-    set({ lastResult: `编辑成功：version ${res.session.version}` });
-    return null;
+    const res = await editLocal(id, patch);
+    if (typeof res !== 'string') {
+      set({ lastResult: `编辑成功（${storageHint()}，待同步）` });
+      set({ sessions: await listSessions() });
+      void requestSync('编辑');
+      return null;
+    }
+    return FAILURE_TEXT[res];
   } catch (e) {
-    if (e instanceof ApiError && e.code === 'VERSION_CONFLICT') {
-      set({
-        conflict: {
-          sessionId: id,
-          message: '服务器版本已变化（VERSION_CONFLICT）',
-          serverSession: e.serverSession,
-          retry,
-        },
-      });
-      return '版本冲突，请在冲突提示中选择处理方式';
-    }
-    if (e instanceof ApiError && e.code === 'SESSION_OVERLAP') {
-      return '编辑后的区间与已有记录重叠，未保存';
-    }
-    return e instanceof ApiError ? `${e.code}: ${e.message}` : 'Network error';
+    return e instanceof Error ? e.message : '保存失败';
   }
 }
 
-async function editSessionDirect(
-  id: string,
-  body: { client_op_id: string; base_version: number; start_at?: string; end_at?: string; quality?: number | null }
-) {
-  return api.editSession(id, body);
-}
+// ---------------------------------------------------------------------------
+// 触发器：回到前台（原生 appResume 事件）/ 网络恢复 / visibilitychange
+// ---------------------------------------------------------------------------
+let triggersBound = false;
 
-/** 冲突处理：采用服务器版本 → 丢弃本地修改意图，仅刷新列表。 */
-export async function resolveConflictAdoptServer(): Promise<void> {
-  set({ conflict: null });
-  await refreshSessions();
-}
-
-/** 冲突处理：保留本地修改并重新提交 → 以最新服务端版本为 base_version 重试一次。 */
-export async function resolveConflictKeepLocal(): Promise<void> {
-  const c = store.conflict;
-  if (c === null) return;
-  set({ conflict: null });
-  try {
-    await c.retry();
-    set({ lastResult: '已基于最新版本重新提交' });
-  } catch {
-    set({ lastResult: '重新提交失败，请重试或采用服务器版本' });
-  }
-  await refreshSessions();
+export function bindSyncTriggers(): void {
+  if (triggersBound) return;
+  triggersBound = true;
+  setUnauthorizedHandler(() => {
+    // 只退出登录态；本地记录与队列全部保留。
+    set({ signedIn: false, status: { kind: 'signed_out' }, lastResult: null });
+  });
+  window.addEventListener('appResume', () => {
+    if (store.signedIn) void requestSync('回到前台');
+  });
+  window.addEventListener('online', () => {
+    if (store.signedIn) void requestSync('网络恢复');
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && store.signedIn) void requestSync('回到前台');
+  });
 }

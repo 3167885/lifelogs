@@ -104,16 +104,30 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+const REQUEST_TIMEOUT_MS = 15_000;
+
 async function request<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (authToken !== null) {
     headers.Authorization = `Bearer ${authToken}`;
   }
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: init.method ?? 'GET',
-    headers,
-    body: init.body === undefined ? undefined : JSON.stringify(init.body),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}${path}`, {
+      method: init.method ?? 'GET',
+      headers,
+      body: init.body === undefined ? undefined : JSON.stringify(init.body),
+      signal: controller.signal,
+    });
+  } catch (e) {
+    // 断网/超时统一成可重试的 NetworkError，不误判为业务失败。
+    const msg = e instanceof Error && e.name === 'AbortError' ? '请求超时' : '网络不可用';
+    throw new NetworkError(msg);
+  } finally {
+    clearTimeout(timer);
+  }
 
   let data: unknown = null;
   try {
@@ -130,13 +144,34 @@ async function request<T>(path: string, init: { method?: string; body?: unknown 
       if (typeof data.error.code === 'string') code = data.error.code;
       if (typeof data.error.message === 'string') message = data.error.message;
     }
-    if (isRecord(data) && isRecord(data.session)) {
+    // VERSION_CONFLICT 的权威记录在顶层 session 字段（阶段 1 契约）。
+    if (isRecord(data) && isRecord(data.session) && isRecordSessionView(data.session)) {
       serverSession = data.session as unknown as SessionView;
     }
     throw new ApiError(res.status, code, message, serverSession);
   }
 
   return data as T;
+}
+
+/** 网络层错误（断网/超时）：结果未知，同步侧必须复用幂等键重试。 */
+export class NetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NetworkError';
+  }
+}
+
+function isRecordSessionView(v: Record<string, unknown>): boolean {
+  return (
+    typeof v.id === 'string' &&
+    typeof v.start_at === 'string' &&
+    typeof v.end_at === 'string' &&
+    typeof v.duration_minutes === 'number' &&
+    typeof v.version === 'number' &&
+    typeof v.updated_at === 'string' &&
+    typeof v.created_at === 'string'
+  );
 }
 
 export const api = {
@@ -168,6 +203,10 @@ export const api = {
   },
   getSessions(limit = 100): Promise<SessionsPage> {
     return request<SessionsPage>(`/api/sessions?limit=${limit}`);
+  },
+  getSessionsSince(sinceUpdatedAt: string, sinceId: string, limit = 100): Promise<SessionsPage> {
+    const p = new URLSearchParams({ since_updated_at: sinceUpdatedAt, since_id: sinceId, limit: String(limit) });
+    return request<SessionsPage>(`/api/sessions?${p.toString()}`);
   },
   insertSession(body: InsertSessionBody): Promise<{ session: SessionView }> {
     return request<{ session: SessionView }>('/api/sessions', { method: 'POST', body });

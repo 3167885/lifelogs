@@ -1,6 +1,6 @@
 import { useState } from 'preact/hooks';
 import { editSession } from '../state.js';
-import type { SessionView } from '../api.js';
+import type { LocalSession } from '../local.js';
 
 function toLocalInput(iso: string): string {
   const d = new Date(iso);
@@ -13,7 +13,15 @@ function toUtcIso(localValue: string): string | null {
   return Number.isNaN(ms) ? null : new Date(ms).toISOString();
 }
 
-export function EditPage({ session, onDone }: { session: SessionView; onDone: () => void }): preact.JSX.Element {
+export function EditPage({
+  session,
+  onDone,
+  afterDone,
+}: {
+  session: LocalSession;
+  onDone: () => void;
+  afterDone: () => void;
+}): preact.JSX.Element {
   const [start, setStart] = useState(toLocalInput(session.start_at));
   const [end, setEnd] = useState(toLocalInput(session.end_at));
   const [quality, setQuality] = useState(session.quality === null ? '' : String(session.quality));
@@ -30,21 +38,25 @@ export function EditPage({ session, onDone }: { session: SessionView; onDone: ()
       return;
     }
     setBusy(true);
-    const result = await editSession(session.id, session.version, {
+    const result = await editSession(session.id, {
       start_at: s,
       end_at: en,
       quality: quality === '' ? null : Number(quality),
     });
     setBusy(false);
     if (result !== null) setError(result);
-    else onDone();
+    else {
+      onDone();
+      afterDone();
+    }
   }
 
   return (
     <section class="card">
       <h1>编辑记录</h1>
       <p class="hint">
-        服务器版本 v{session.version}：{session.duration_minutes} 分钟
+        本地 v{session.version}：{session.duration_minutes} 分钟 ·{' '}
+        {session.sync_state === 'synced' ? '已同步' : '待同步'}
       </p>
       <form onSubmit={onSubmit}>
         <label>
@@ -61,7 +73,7 @@ export function EditPage({ session, onDone }: { session: SessionView; onDone: ()
         </label>
         <div class="row">
           <button type="submit" disabled={busy}>{busy ? '保存中…' : '保存'}</button>
-          <button type="button" onClick={onDone}>取消</button>
+          <button type="button" onClick={afterDone}>取消</button>
         </div>
         {error !== null && <p class="error">{error}</p>}
       </form>

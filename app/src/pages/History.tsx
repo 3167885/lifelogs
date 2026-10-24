@@ -1,29 +1,31 @@
 import { useState } from 'preact/hooks';
-import { refreshSessions, useStore } from '../state.js';
+import { refreshStatus, useStore } from '../state.js';
 import { EditPage } from './Edit.js';
-import type { SessionView } from '../api.js';
+import type { LocalSession } from '../local.js';
 
 function local(iso: string): string {
   return new Date(iso).toLocaleString();
 }
 
+function syncLabel(s: LocalSession): string {
+  if (s.sync_state === 'synced') return '已同步';
+  return s.source === 'paired' ? '待同步（临时配对）' : '待同步';
+}
+
 export function HistoryPage(): preact.JSX.Element {
-  const s = useStore();
-  const [editing, setEditing] = useState<SessionView | null>(null);
+  const store = useStore();
+  const [editing, setEditing] = useState<LocalSession | null>(null);
 
   if (editing !== null) {
-    return <EditPage session={editing} onDone={() => setEditing(null)} />;
+    return <EditPage session={editing} onDone={() => void refreshStatus()} afterDone={() => setEditing(null)} />;
   }
 
   return (
     <section class="card">
       <h1>历史记录</h1>
-      <div class="row">
-        <button onClick={() => void refreshSessions()}>从服务器刷新</button>
-      </div>
-      {s.sessions.length === 0 && <p class="hint">暂无记录。可在「补录」页添加。</p>}
+      {store.sessions.length === 0 && <p class="hint">暂无记录。可在「补录」页添加。</p>}
       <ul class="session-list">
-        {s.sessions.map((item) => (
+        {store.sessions.map((item) => (
           <li key={item.id} class="session-item">
             <div>
               <strong>{item.duration_minutes} 分钟</strong>
@@ -31,7 +33,8 @@ export function HistoryPage(): preact.JSX.Element {
                 {local(item.start_at)} → {local(item.end_at)}
               </div>
               <div class="meta">
-                质量：{item.quality ?? '—'} · v{item.version} · 已同步（服务端确认）
+                质量：{item.quality ?? '—'} · v{item.version} · {syncLabel(item)}
+                {item.conflict_note !== null ? ` · ⚠ ${item.conflict_note}` : ''}
               </div>
             </div>
             <button onClick={() => setEditing(item)}>编辑</button>

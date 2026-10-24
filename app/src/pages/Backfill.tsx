@@ -31,7 +31,7 @@ export function BackfillPage(): preact.JSX.Element {
     setBusy(false);
     if (result !== null) setError(result);
     else {
-      setOk('补录成功（已写入服务器）');
+      setOk('补录成功（已保存到本地，待同步）');
       setStart('');
       setEnd('');
       setQuality('');
@@ -58,7 +58,7 @@ export function BackfillPage(): preact.JSX.Element {
         {error !== null && <p class="error">{error}</p>}
         {ok !== null && <p class="result">{ok}</p>}
       </form>
-      <p class="hint">阶段 2：补录直接同步写入服务器；离线补录与待同步状态在阶段 3 实现。</p>
+      <p class="hint">补录先保存在本地，联网后由同步引擎推送到服务器（里程碑二）。</p>
     </section>
   );
 }

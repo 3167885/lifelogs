@@ -4,6 +4,8 @@ const config: CapacitorConfig = {
   appId: 'com.lifelogs.sleep',
   appName: 'Sleep Tracker',
   webDir: 'dist',
+  // 默认 debug 桥接日志会把完整 Bearer token 打印到 logcat。
+  loggingBehavior: 'none',
   server: {
     // https scheme → WebView origin is https://localhost, which is in the
     // backend CORS allowlist (阶段 1). cleartext is enabled ONLY because the
