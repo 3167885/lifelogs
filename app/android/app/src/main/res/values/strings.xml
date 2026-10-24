@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Sleep Tracker</string>
+    <string name="title_activity_main">Sleep Tracker</string>
+    <string name="package_name">com.lifelogs.sleep</string>
+    <string name="custom_url_scheme">com.lifelogs.sleep</string>
+</resources>

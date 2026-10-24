@@ -1,0 +1,26 @@
+{
+  "name": "@lifelogs/sleep-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "cap:sync": "cap sync android",
+    "apk:debug": "cd android && ./gradlew assembleDebug",
+    "apk:release": "cd android && ./gradlew assembleRelease"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.5.3",
+    "@capacitor/core": "8.5.3",
+    "preact": "^10.23.1"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.5.3",
+    "@preact/preset-vite": "^2.10.6",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.12"
+  }
+}
