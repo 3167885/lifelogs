@@ -4,11 +4,27 @@ import type { Env, User, Session, Variables } from '../lib/types.js';
 
 const SESSION_COOKIE_NAME = 'lifelogs_session';
 
+/**
+ * Extract the bearer token from the Authorization header, if present.
+ * Used by the APK (阶段 1): the token is an existing auth_sessions row id
+ * created via POST /api/auth/token. Sessions are validated with exactly the
+ * same query as cookie sessions; nothing bypasses the session check.
+ */
+function extractBearer(header: string | null | undefined): string | null {
+  if (!header) {
+    return null;
+  }
+  const match = /^Bearer (.+)$/i.exec(header.trim());
+  return match ? match[1] : null;
+}
+
 export async function authMiddleware(
   c: Context<{ Bindings: Env; Variables: Variables }>,
   next: Next
 ) {
-  const sessionId = getCookie(c, SESSION_COOKIE_NAME);
+  const sessionId =
+    getCookie(c, SESSION_COOKIE_NAME) ??
+    extractBearer(c.req.header('authorization'));
 
   if (sessionId) {
     const session = await c.env.DB.prepare(
@@ -21,7 +37,7 @@ export async function authMiddleware(
       const user = await c.env.DB.prepare(
         'SELECT id, email, email_verified, created_at, updated_at FROM auth_users WHERE id = ?'
       )
-        .bind(session.user_id)
+      .bind(session.user_id)
         .first<User>();
 
       if (user) {
@@ -47,4 +63,4 @@ export async function requireAuth(
   await next();
 }
 
-export { SESSION_COOKIE_NAME };
+export { SESSION_COOKIE_NAME, extractBearer };

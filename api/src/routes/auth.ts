@@ -138,6 +138,64 @@ auth.post('/logout', async (c) => {
   return c.json({ success: true });
 });
 
+// APK token login (阶段 1): verify credentials with the same PBKDF2 logic and
+// create a normal auth_sessions row, but return the session id as a Bearer
+// token instead of setting a cookie. All subsequent requests validate the
+// token through the shared authMiddleware session lookup.
+auth.post('/token', zValidator('json', loginSchema), async (c) => {
+  const { email, password } = c.req.valid('json');
+
+  const user = await c.env.DB.prepare(
+    'SELECT * FROM auth_users WHERE email = ?'
+  )
+    .bind(email.toLowerCase())
+    .first<User & { password_hash: string }>();
+
+  if (!user) {
+    return c.json({ error: 'Invalid email or password' }, 401);
+  }
+
+  const valid = await verifyPassword(password, user.password_hash);
+  if (!valid) {
+    return c.json({ error: 'Invalid email or password' }, 401);
+  }
+
+  const sessionId = crypto.randomUUID();
+  const now = Date.now();
+  const expiresAt = now + SESSION_DURATION_MS;
+
+  await c.env.DB.prepare(
+    'INSERT INTO auth_sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+  )
+    .bind(sessionId, user.id, expiresAt, now)
+    .run();
+
+  // No logging of token or password anywhere in this handler.
+  return c.json({
+    token: sessionId,
+    token_type: 'Bearer',
+    expires_at: new Date(expiresAt).toISOString(),
+    user: {
+      id: user.id,
+      email: user.email,
+      email_verified: user.email_verified,
+    },
+  });
+});
+
+// Revoke the caller's own server-side session (APK logout).
+auth.delete('/token', requireAuth, async (c) => {
+  const session = c.get('session');
+
+  if (session) {
+    await c.env.DB.prepare('DELETE FROM auth_sessions WHERE id = ?')
+      .bind(session.id)
+      .run();
+  }
+
+  return c.json({ success: true });
+});
+
 // Get current user
 auth.get('/me', requireAuth, async (c) => {
   const user = c.get('user')!;

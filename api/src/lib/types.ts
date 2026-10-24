@@ -66,3 +66,39 @@ export type Variables = {
   user?: User;
   session?: Session;
 };
+
+// ---- Sleep tracking (阶段 1) ----
+// All timestamps are normalized UTC ISO 8601: YYYY-MM-DDTHH:mm:ss.sssZ
+
+export interface SleepEvent {
+  id: string;
+  user_id: string;
+  client_event_id: string;
+  event_type: 'sleep' | 'wake';
+  occurred_at: string;
+  session_id: string | null;
+  created_at: string;
+}
+
+export interface SleepSession {
+  id: string;
+  user_id: string;
+  sleep_event_id: string | null;
+  wake_event_id: string | null;
+  start_at: string;
+  end_at: string;
+  duration_minutes: number;
+  quality: number | null;
+  version: number;
+  created_at: string;
+  updated_at: string;
+  last_op_id: string | null;
+}
+
+export interface SyncOp {
+  user_id: string;
+  client_op_id: string;
+  op_type: string;
+  result_json: string | null;
+  created_at: string;
+}
