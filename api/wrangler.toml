@@ -1,27 +1,39 @@
-name = "lifelogs-api"
+# Dedicated Worker + D1 for the sleep tracker. No upstream (elliotaplant/lifelogs)
+# Worker name, route, zone or database_id is referenced anywhere in this file.
+name = "lifelogs-sleep-api"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [vars]
 ENVIRONMENT = "development"
 
+# Dev/local binding. The same dedicated database backs local and production;
+# local commands use its local SQLite mirror under .wrangler/state.
 [[d1_databases]]
 binding = "DB"
-database_name = "lifelogs-db"
-database_id = "c4c465cd-f184-4c10-afc6-fc42bc36f77e"
+database_name = "lifelogs-sleep-db"
+database_id = "ece65d80-a324-4f58-89cb-af867fcec04f"
 
-# Production environment
+# Production: dedicated Worker served from the project's own custom domain.
+# Binding a Custom Domain makes Cloudflare create the sleep.extra.us.ci DNS
+# record and certificate; the Worker then owns every path on that hostname, so
+# the /api/* API paths are unchanged. workers_dev stays enabled as a secondary
+# test entry point only — clients learn their API origin from VITE_API_BASE_URL
+# and no source file hardcodes a Worker URL.
 [env.production]
-name = "lifelogs-api"
+name = "lifelogs-sleep-api"
+workers_dev = true
 routes = [
-  { pattern = "lifelogs.elliotplant.com/api/*", zone_name = "elliotplant.com" }
+  { pattern = "sleep.extra.us.ci", custom_domain = true }
 ]
 
+# APP_URL is intentionally unset: it means "deployed web frontend origin" and
+# must NOT be set to the API domain. CORS only needs the Capacitor WebView
+# origin (https://localhost), which is always allowed.
 [env.production.vars]
 ENVIRONMENT = "production"
-APP_URL = "https://lifelogs.elliotplant.com"
 
 [[env.production.d1_databases]]
 binding = "DB"
-database_name = "lifelogs-db"
-database_id = "c4c465cd-f184-4c10-afc6-fc42bc36f77e"
+database_name = "lifelogs-sleep-db"
+database_id = "ece65d80-a324-4f58-89cb-af867fcec04f"

@@ -8,8 +8,8 @@
     "build": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy --env production",
     "typecheck": "tsc --noEmit",
-    "db:migrate": "wrangler d1 execute lifelogs-db --local --file=src/db/schema.sql && wrangler d1 execute lifelogs-db --local --file=src/db/sleep_schema.sql",
-    "db:migrate:prod": "wrangler d1 execute lifelogs-db --remote --file=src/db/schema.sql",
+    "db:migrate": "wrangler d1 execute lifelogs-sleep-db --local --file=src/db/schema.sql && wrangler d1 execute lifelogs-sleep-db --local --file=src/db/sleep_schema.sql",
+    "db:migrate:prod": "wrangler d1 execute lifelogs-sleep-db --remote --env production --file=src/db/schema.sql && wrangler d1 execute lifelogs-sleep-db --remote --env production --file=src/db/sleep_schema.sql",
     "wrangler": "wrangler"
   },
   "dependencies": {

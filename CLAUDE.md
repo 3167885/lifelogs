@@ -50,8 +50,8 @@ cd web && npm run dev
 ## Deployment
 
 ```bash
-# Create D1 database (first time only)
-cd api && wrangler d1 create lifelogs-db
+# Create D1 database (first time only; already created for sleep.extra.us.ci)
+cd api && wrangler d1 create lifelogs-sleep-db
 
 # Update wrangler.toml with the database_id from above
 

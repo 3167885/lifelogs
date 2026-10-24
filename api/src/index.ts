@@ -15,10 +15,14 @@ const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 // Global middleware
 app.use('*', logger());
 app.use('*', async (c, next) => {
-  // Explicit origin allowlist (no "*"): legacy SvelteKit dev/preview origins
-  // keep Cookie CORS working; https://localhost is the default Capacitor
-  // Android WebView origin. APP_URL covers the deployed web frontend.
-  const origins = ['http://localhost:5173', 'http://localhost:4173', 'https://localhost'];
+  // Explicit origin allowlist (no "*"). https://localhost is the Capacitor
+  // Android WebView origin and is required in every environment; the legacy
+  // SvelteKit dev/preview origins are only allowed off production. APP_URL
+  // covers a deployed web frontend when one exists.
+  const origins = ['https://localhost'];
+  if (c.env.ENVIRONMENT !== 'production') {
+    origins.push('http://localhost:5173', 'http://localhost:4173');
+  }
   if (c.env.APP_URL) {
     origins.push(c.env.APP_URL);
   }
