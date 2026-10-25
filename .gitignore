@@ -14,10 +14,16 @@ build/
 .env
 .env.local
 .env.*.local
+app/.env.production
 
 # Logs
 *.log
 npm-debug.log*
+
+# Android release signing material
+app/android/keystore.properties
+*.jks
+*.keystore
 
 # IDE
 .idea/

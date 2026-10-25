@@ -1,5 +1,11 @@
 apply plugin: 'com.android.application'
 
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
 android {
     namespace = "com.lifelogs.sleep"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -16,17 +22,30 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            if (keystorePropertiesFile.exists()) {
+                storeFile file(keystoreProperties['storeFile'])
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
     buildTypes {
+        debug {
+            manifestPlaceholders = [
+                usesCleartextTraffic: System.getenv('CAPACITOR_DEV_HTTP') == '1' ? 'true' : 'false'
+            ]
+        }
         release {
             // 阶段 2 R8 baseline: AGP 8.13 enables R8 full mode by default,
             // so no android.enableR8.fullMode property is needed (adding it
             // would be deprecated/no-op). shrinkResources requires minify.
-            // signingConfig uses debug ONLY so the local test APK can be
-            // installed on the emulator without a release keystore — it is
-            // not a distribution signing posture (阶段 4 handles release).
             minifyEnabled true
             shrinkResources true
-            signingConfig signingConfigs.debug
+            manifestPlaceholders = [usesCleartextTraffic: 'false']
+            signingConfig signingConfigs.release
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
     }
@@ -51,6 +70,32 @@ dependencies {
 }
 
 apply from: 'capacitor.build.gradle'
+
+tasks.register('assertProductionConfig') {
+    doLast {
+        if (System.getenv('CAPACITOR_DEV_HTTP') == '1') {
+            throw new GradleException('CAPACITOR_DEV_HTTP=1 is development-only; release builds must use HTTPS')
+        }
+        if (!keystorePropertiesFile.exists()) {
+            throw new GradleException('Missing android/keystore.properties; release builds require a non-debug signing key')
+        }
+        def configFile = file('src/main/assets/capacitor.config.json')
+        if (!configFile.exists()) {
+            throw new GradleException('Missing capacitor.config.json; run npm run cap:sync:production')
+        }
+        def capConfig = new groovy.json.JsonSlurper().parseText(configFile.text)
+        if (capConfig.loggingBehavior != 'none') {
+            throw new GradleException('Capacitor logging must be disabled for release')
+        }
+        if (capConfig.server?.cleartext == true || capConfig.android?.allowMixedContent == true) {
+            throw new GradleException('Release config must not enable cleartext or mixed content')
+        }
+    }
+}
+
+tasks.matching { it.name == 'preReleaseBuild' }.configureEach {
+    dependsOn tasks.named('assertProductionConfig')
+}
 
 try {
     def servicesJSON = file('google-services.json')

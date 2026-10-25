@@ -1,28 +1,22 @@
 import type { CapacitorConfig } from '@capacitor/cli';
 
+const devHttpEnabled = process.env.CAPACITOR_DEV_HTTP === '1';
+
 const config: CapacitorConfig = {
   appId: 'com.lifelogs.sleep',
   appName: 'Sleep Tracker',
   webDir: 'dist',
-  // 默认 debug 桥接日志会把完整 Bearer token 打印到 logcat。
+  // Keep bridge logs off in every build; request bodies and headers can contain
+  // credentials even when the app itself never logs them.
   loggingBehavior: 'none',
   server: {
-    // https scheme → WebView origin is https://localhost, which is in the
-    // backend CORS allowlist (阶段 1). cleartext is enabled ONLY because the
-    // local dev backend is plain http on 10.0.2.2:8787; this is a dev/test
-    // configuration, not a release posture.
     androidScheme: 'https',
-    cleartext: true,
+    cleartext: devHttpEnabled,
   },
   android: {
-    // DEV/TEST ONLY (阶段 2 本地联调): the page origin is https://localhost
-    // while the local backend is plain http://10.0.2.2:8787. Android's
-    // `cleartext` alone does NOT lift WebView page-level Mixed Content
-    // blocking; Chromium blocks https-page → http-resource requests.
-    // allowMixedContent is required for THIS local pairing only. A release
-    // build must point at an https backend and remove both flags — tracked
-    // as a 阶段 4 item; do not treat this as a production posture.
-    allowMixedContent: true,
+    // Only the explicit local-emulator opt-in may permit HTTPS page → HTTP API.
+    // A normal production Cap sync leaves both this and cleartext disabled.
+    allowMixedContent: devHttpEnabled,
   },
 };
 

@@ -2,15 +2,13 @@
  * Typed client for the 阶段 1 backend contract. ALL network calls go through
  * this module; pages never hardcode URLs or paths.
  *
- * Base URL selection (approved 阶段 2 detail 1):
- * - native (Android WebView): http://10.0.2.2:8787 (emulator → host loopback)
- * - browser dev:              http://localhost:8787
+ * The base URL is injected by Vite from VITE_API_BASE_URL. Development falls
+ * back to the local Worker; production builds fail closed unless an HTTPS URL
+ * is explicitly configured.
  */
-import { Capacitor } from '@capacitor/core';
+declare const __API_BASE_URL__: string;
 
-const API_BASE: string = Capacitor.isNativePlatform()
-  ? 'http://10.0.2.2:8787'
-  : 'http://localhost:8787';
+const API_BASE: string = __API_BASE_URL__;
 
 export interface SessionView {
   id: string;
