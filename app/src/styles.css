@@ -134,6 +134,16 @@ button:disabled {
   font-size: 1rem;
 }
 
+.conflict-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.conflict-actions button {
+  width: 100%;
+}
+
 .tabbar {
   position: fixed;
   left: 0;

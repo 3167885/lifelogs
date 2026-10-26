@@ -5,7 +5,7 @@ import type { LocalSession } from '../local.js';
 function toLocalInput(iso: string): string {
   const d = new Date(iso);
   const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function toUtcIso(localValue: string): string | null {
@@ -61,11 +61,11 @@ export function EditPage({
       <form onSubmit={onSubmit}>
         <label>
           开始时间
-          <input type="datetime-local" value={start} onInput={(e) => setStart((e.target as HTMLInputElement).value)} />
+          <input type="datetime-local" step="1" value={start} onInput={(e) => setStart((e.target as HTMLInputElement).value)} />
         </label>
         <label>
           结束时间
-          <input type="datetime-local" value={end} onInput={(e) => setEnd((e.target as HTMLInputElement).value)} />
+          <input type="datetime-local" step="1" value={end} onInput={(e) => setEnd((e.target as HTMLInputElement).value)} />
         </label>
         <label>
           质量（1–5，留空清除）

@@ -4,8 +4,8 @@
  * - 串行消费 local_ops（FIFO，一次一条，绝不并发推送）。
  * - 幂等：sleep/wake 固定复用 client_event_id；backfill/edit 固定复用
  *   client_op_id（创建时生成、发送前冻结落盘、重试不换 key）。
- * - edit 的 base_version 在发送时取本地「最后服务端确认版本」，离线多次
- *   编辑只推最后一条 → 不产生伪冲突。
+ * - edit 的 base_version 来自队列 payload 的原始服务端确认版本；离线多次
+ *   编辑只推最后一条，不会把本地待同步编辑误当成新的同步基准。
  * - 网络错误/超时/5xx/408/429：保留队列，attempts+1；确定性业务失败
  *   （400/403/404/409/422）标记 failed 并保留本地数据，手动同步可重置。
  * - 401：清 token、保留全部本地数据与队列，提示重新登录。
@@ -14,16 +14,21 @@
  * - 触发：启动 / 回到前台 / 网络恢复 / 手动；单飞锁防重复循环。
  */
 import { api, ApiError, NetworkError, setAuthToken, type SessionView } from './api.js';
+import { storeToken } from './secure-token.js';
 import {
   applyServerSession,
   bumpOpAttempts,
   countPendingOps,
   deleteOp,
+  firstFailedOp,
   getSession,
+  markOpInFlight,
   markOpFailed,
   nextPendingOp,
   persistOpPayload,
   pendingWakeIntervals,
+  recoverStaleInFlightOps,
+  recordVersionConflict,
   replacePairedWithServer,
   resetFailedOps,
   getMeta,
@@ -104,6 +109,7 @@ function toLocalSession(v: SessionView, source: LocalSession['source']): LocalSe
     duration_minutes: v.duration_minutes,
     quality: v.quality,
     version: v.version,
+    base_version: null,
     source,
     sync_state: 'synced',
     conflict_note: null,
@@ -202,7 +208,7 @@ async function pushEditOp(op: QueuedOp): Promise<void> {
   const p = await ensureKey(op, p0, 'client_op_id');
   const res = await api.editSession(op.ref_id, {
     client_op_id: p.client_op_id,
-    base_version: session.version,
+    base_version: p.base_version ?? session.base_version ?? session.version,
     start_at: p.start_at,
     end_at: p.end_at,
     quality: p.quality,
@@ -222,9 +228,11 @@ type DrainResult = 'done' | 'offline' | 'unauthorized' | 'failed';
  * 一次），下一次重试由自然触发点（启动/回前台/联网/手动）带来。
  */
 async function drainAll(): Promise<DrainResult> {
+  await recoverStaleInFlightOps();
   for (;;) {
     const op = await nextPendingOp();
     if (op === null) return 'done';
+    await markOpInFlight(op.id);
     try {
       if (op.kind === 'sleep') await pushSleepOp(op);
       else if (op.kind === 'wake') await pushWakeOp(op);
@@ -234,6 +242,7 @@ async function drainAll(): Promise<DrainResult> {
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         setAuthToken(null);
+        await storeToken(null);
         await bumpOpAttempts(op.id, '401');
         if (unauthorizedHandler !== null) unauthorizedHandler();
         return 'unauthorized';
@@ -245,6 +254,14 @@ async function drainAll(): Promise<DrainResult> {
       if (e instanceof ApiError && (e.status >= 500 || e.status === 408 || e.status === 429)) {
         await bumpOpAttempts(op.id, `${e.status} ${e.message}`);
         return 'offline';
+      }
+      if (
+        e instanceof ApiError &&
+        e.status === 409 &&
+        e.code === 'VERSION_CONFLICT' &&
+        e.serverSession !== null
+      ) {
+        await recordVersionConflict(op.ref_id, toLocalSession(e.serverSession, 'server'));
       }
       if (e instanceof ApiError) {
         await markOpFailed(op.id, `${e.code}: ${e.message}`);
@@ -308,6 +325,7 @@ export async function syncOnce(reason: string): Promise<void> {
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
         setAuthToken(null);
+        await storeToken(null);
         if (unauthorizedHandler !== null) unauthorizedHandler();
         setSnapshot({ phase: 'unauthorized', message: '登录已过期，本地记录已保留', pendingCount: await countPendingOps(), lastAt: new Date().toISOString() });
         return;
@@ -325,7 +343,7 @@ export async function syncOnce(reason: string): Promise<void> {
   if (drain === 'unauthorized') {
     setSnapshot({ phase: 'unauthorized', message: '登录已过期，本地记录已保留，请重新登录', pendingCount: pending, lastAt });
   } else if (drain === 'offline') {
-    setSnapshot({ phase: 'offline', message: `离线或超时，${pending} 条待同步`, pendingCount: pending, lastAt });
+    setSnapshot({ phase: 'offline', message: '离线或超时', pendingCount: pending, lastAt });
   } else if (drain === 'failed') {
     const firstFailed = await firstFailedMessage();
     setSnapshot({ phase: 'failed', message: firstFailed ?? '部分操作被服务端拒绝，本地数据已保留', pendingCount: pending, lastAt });
@@ -340,9 +358,8 @@ export async function syncOnce(reason: string): Promise<void> {
 }
 
 async function firstFailedMessage(): Promise<string | null> {
-  // failed 项的 last_error 直接读队列（无专用导出接口，用 nextPendingOp 之外的方式不可行；
-  // 简化：把最后错误放入 snapshot.message 已在调用侧处理）。
-  return null;
+  const op = await firstFailedOp();
+  return op?.last_error ?? null;
 }
 
 /** 手动同步：重置 failed 队列后跑一轮（失败的确定性业务操作重新排队）。 */

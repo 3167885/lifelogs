@@ -9,6 +9,8 @@ import { useEffect, useState } from 'preact/compat';
 import { api, ApiError, setAuthToken } from './api.js';
 import {
   addBackfill,
+  clearLocalData,
+  conflictFor,
   countPendingOps,
   editLocal,
   getMeta,
@@ -19,6 +21,8 @@ import {
   listSessions,
   recordSleep,
   recordWake,
+  resolveConflictWithLocal,
+  resolveConflictWithServer,
   setMeta,
   storageErrorMessage,
   type LocalSession,
@@ -134,7 +138,6 @@ export async function login(email: string, password: string): Promise<string | n
         return `本机还有 ${pending} 条属于原账号的待同步记录，请先同步或回到原账号`;
       }
       // 无待推送数据 → 提示后清空旧数据再接新账号（MVP：直接清）。
-      const { clearLocalData } = await import('./local.js');
       await clearLocalData();
     }
     await setMeta('owner.user_id', res.user.id);
@@ -159,7 +162,8 @@ export async function logout(): Promise<void> {
   }
   setAuthToken(null);
   await storeToken(null);
-  set({ signedIn: false, status: { kind: 'signed_out' }, sessions: [], lastResult: null });
+  set({ signedIn: false, status: { kind: 'signed_out' }, lastResult: null });
+  await reloadFromLocal();
 }
 
 export async function refreshStatus(): Promise<void> {
@@ -170,6 +174,20 @@ export async function refreshStatus(): Promise<void> {
 export async function syncNow(): Promise<void> {
   await manualSync();
   await afterSyncRefresh();
+}
+
+export async function resolveConflict(id: string, choice: 'server' | 'local'): Promise<string | null> {
+  const conflict = await conflictFor(id);
+  if (conflict === null) return '未找到待解决的版本冲突';
+  if (conflict.server === null) return '缺少服务端版本快照，请重新同步后再试';
+  const ok =
+    choice === 'server'
+      ? await resolveConflictWithServer(id)
+      : await resolveConflictWithLocal(id);
+  if (!ok) return '冲突处理失败，本地数据未改动';
+  await reloadFromLocal();
+  if (choice === 'local' && store.signedIn) void requestSync('冲突重试');
+  return null;
 }
 
 function storageHint(): string {

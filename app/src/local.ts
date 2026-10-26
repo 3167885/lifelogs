@@ -5,8 +5,10 @@
  * - 业务行与 local_ops 队列项在同一事务写入：强杀进程不会留下
  *   「有记录但没排队」或反之的半成品。
  * - local_sessions.version 只表示「最后一次服务端确认的版本」；本地编辑
- *   不自增 version，只把 sync_state 置 'local'。edit 发送时以当前 version
- *   作 base_version（见 sync.ts）。
+ *   不自增 version，只把 sync_state 置 'local'。首次编辑把该确认版本冻结
+ *   到 base_version，后续离线编辑和重试都复用它（见 sync.ts）。
+ * - local_ops 推送前标记 in_flight；异常退出留下的项在 30 秒后恢复 pending，
+ *   由幂等键保证可安全重放。
  * - 原生平台若数据库不可用（初始化失败），写操作直接抛错并由 UI 显示；
  *   绝不静默退回内存表（否则用户以为已保存，重启全丢）。
  * - 浏览器开发环境没有原生 SQLite：内存表 + 明确提示「重启即丢」。
@@ -20,12 +22,12 @@ import { CapacitorSQLite, SQLiteConnection } from '@capacitor-community/sqlite';
 import type { SQLiteDBConnection } from '@capacitor-community/sqlite';
 
 const DB_NAME = 'sleepdb';
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export type SessionSource = 'paired' | 'backfill' | 'server';
 export type SyncState = 'local' | 'synced';
 export type OpKind = 'sleep' | 'wake' | 'backfill' | 'edit';
-export type OpStatus = 'pending' | 'failed';
+export type OpStatus = 'pending' | 'in_flight' | 'failed';
 
 export interface LocalSession {
   id: string;
@@ -34,6 +36,7 @@ export interface LocalSession {
   duration_minutes: number;
   quality: number | null;
   version: number;
+  base_version: number | null;
   source: SessionSource;
   sync_state: SyncState;
   conflict_note: string | null;
@@ -50,6 +53,7 @@ export interface QueuedOp {
   status: OpStatus;
   attempts: number;
   last_error: string | null;
+  in_flight_since: string | null;
 }
 
 export interface SleepPayload {
@@ -72,6 +76,7 @@ export interface BackfillPayload {
 export interface EditPayload {
   session_id: string;
   client_op_id: string;
+  base_version: number;
   start_at: string;
   end_at: string;
   quality: number | null;
@@ -164,6 +169,7 @@ const DDL: string[] = [
      duration_minutes INTEGER NOT NULL,
      quality INTEGER NULL CHECK (quality BETWEEN 1 AND 5),
      version INTEGER NOT NULL DEFAULT 1,
+     base_version INTEGER NULL,
      source TEXT NOT NULL CHECK (source IN ('paired','backfill','server')),
      sync_state TEXT NOT NULL DEFAULT 'local' CHECK (sync_state IN ('local','synced')),
      conflict_note TEXT NULL,
@@ -177,9 +183,10 @@ const DDL: string[] = [
      ref_id TEXT NOT NULL,
      payload TEXT NOT NULL,
      created_at TEXT NOT NULL,
-     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','failed')),
+     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','in_flight','failed')),
      attempts INTEGER NOT NULL DEFAULT 0,
-     last_error TEXT NULL
+     last_error TEXT NULL,
+     in_flight_since TEXT NULL
    )`,
 ];
 
@@ -228,7 +235,7 @@ export async function initLocal(): Promise<string | null> {
       values: [],
     });
     await c.executeSet(stmts, true, 'no', true);
-    await migrateToV2(c);
+    await migrateToV3(c);
     conn = c;
     storageError = null;
     return null;
@@ -239,27 +246,71 @@ export async function initLocal(): Promise<string | null> {
   }
 }
 
-/** v1 → v2：local_ops 增加 status/attempts/last_error（幂等，缺列才 ALTER）。 */
-async function migrateToV2(c: SQLiteDBConnection): Promise<void> {
+/** 旧库 → v3：补列并允许 in_flight；SQLite 不能改 CHECK，故原子重建表。 */
+async function migrateToV3(c: SQLiteDBConnection): Promise<void> {
+  const sessionInfo = asRows((await c.query(`PRAGMA table_info(local_sessions)`, [], true)).values);
+  const sessionColumns = sessionInfo.map((r) => cellStr(r, 'name'));
+  if (sessionColumns.length > 0 && !sessionColumns.includes('base_version')) {
+    await c.executeSet([
+      { statement: `ALTER TABLE local_sessions ADD COLUMN base_version INTEGER NULL`, values: [] },
+    ], true, 'no', true);
+  }
+
   const info = asRows((await c.query(`PRAGMA table_info(local_ops)`, [], true)).values);
   const names = info.map((r) => cellStr(r, 'name'));
-  const set: { statement: string; values: Cell[] }[] = [];
-  if (names.length > 0) {
-    if (!names.includes('status'))
-      set.push({ statement: `ALTER TABLE local_ops ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'`, values: [] });
-    if (!names.includes('attempts'))
-      set.push({ statement: `ALTER TABLE local_ops ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`, values: [] });
-    if (!names.includes('last_error'))
-      set.push({ statement: `ALTER TABLE local_ops ADD COLUMN last_error TEXT NULL`, values: [] });
-  }
-  if (set.length > 0) {
-    set.push({
+  const schemaRows = asRows(
+    (await c.query(
+      `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'local_ops'`,
+      [],
+      true,
+    )).values,
+  );
+  const tableSql = schemaRows[0] ? cellStr(schemaRows[0], 'sql') : '';
+  if (names.length === 0 || tableSql.includes(`'in_flight'`)) return;
+
+  const value = (column: string, fallback: string): string =>
+    names.includes(column) ? column : fallback;
+  const selectColumns = [
+    'id',
+    'kind',
+    'ref_id',
+    'payload',
+    'created_at',
+    value('status', `'pending'`),
+    value('attempts', '0'),
+    value('last_error', 'NULL'),
+    value('in_flight_since', 'NULL'),
+  ].join(', ');
+
+  await c.executeSet([
+    {
+      statement: `CREATE TABLE local_ops_v3 (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL CHECK (kind IN ('sleep','wake','backfill','edit')),
+        ref_id TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','in_flight','failed')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NULL,
+        in_flight_since TEXT NULL
+      )`,
+      values: [],
+    },
+    {
+      statement: `INSERT INTO local_ops_v3
+        (id, kind, ref_id, payload, created_at, status, attempts, last_error, in_flight_since)
+        SELECT ${selectColumns} FROM local_ops`,
+      values: [],
+    },
+    { statement: `DROP TABLE local_ops`, values: [] },
+    { statement: `ALTER TABLE local_ops_v3 RENAME TO local_ops`, values: [] },
+    {
       statement: `INSERT INTO meta (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
                   ON CONFLICT(key) DO UPDATE SET value = '${SCHEMA_VERSION}'`,
       values: [],
-    });
-    await c.executeSet(set, true, 'no', true);
-  }
+    },
+  ], true, 'no', true);
 }
 
 /** 原生平台守卫：DB 不可用直接抛错，由 UI 显示；绝不静默走内存分支。 */
@@ -307,6 +358,7 @@ function memOpRow(kind: OpKind, refId: string, payload: object, now: string): Ro
     status: 'pending',
     attempts: 0,
     last_error: null,
+    in_flight_since: null,
   };
 }
 
@@ -333,6 +385,14 @@ export async function setMeta(key: string, value: string): Promise<void> {
   memMeta.set(key, value);
 }
 
+export async function deleteMeta(key: string): Promise<void> {
+  if (conn !== null) {
+    await runSql(`DELETE FROM meta WHERE key = ?`, [key]);
+    return;
+  }
+  memMeta.delete(key);
+}
+
 // ---------------------------------------------------------------------------
 // 读
 // ---------------------------------------------------------------------------
@@ -357,6 +417,7 @@ function toSession(row: Row): LocalSession {
     duration_minutes: cellNum(row, 'duration_minutes'),
     quality: cellNumOrNull(row, 'quality'),
     version: cellNum(row, 'version'),
+    base_version: cellNumOrNull(row, 'base_version'),
     source: cellStr(row, 'source') as SessionSource,
     sync_state: cellStr(row, 'sync_state') as SyncState,
     conflict_note: cellStrOrNull(row, 'conflict_note'),
@@ -399,10 +460,10 @@ async function hasOverlap(id: string, startAt: string, endAt: string): Promise<b
   return memSessions.some((s) => String(s.id) !== id && String(s.start_at) < endAt && String(s.end_at) > startAt);
 }
 
-const SESSION_INSERT_SQL = `INSERT INTO local_sessions (id, start_at, end_at, duration_minutes, quality, version, source, sync_state, conflict_note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+const SESSION_INSERT_SQL = `INSERT INTO local_sessions (id, start_at, end_at, duration_minutes, quality, version, base_version, source, sync_state, conflict_note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 function sessionValues(s: LocalSession): Cell[] {
-  return [s.id, s.start_at, s.end_at, s.duration_minutes, s.quality, s.version, s.source, s.sync_state, s.conflict_note, s.created_at, s.updated_at];
+  return [s.id, s.start_at, s.end_at, s.duration_minutes, s.quality, s.version, s.base_version, s.source, s.sync_state, s.conflict_note, s.created_at, s.updated_at];
 }
 
 function opStmt(kind: OpKind, refId: string, payload: object, now: string): { statement: string; values: Cell[] } {
@@ -459,6 +520,7 @@ export async function recordWake(occurredAt: string): Promise<{ session: LocalSe
     duration_minutes: durationMinutes(startMs, endMs),
     quality: null,
     version: 1,
+    base_version: null,
     source: 'paired',
     sync_state: 'local',
     conflict_note: null,
@@ -510,6 +572,7 @@ export async function addBackfill(
     duration_minutes: durationMinutes(startMs, endMs),
     quality,
     version: 1,
+    base_version: null,
     source: 'backfill',
     sync_state: 'local',
     conflict_note: null,
@@ -556,11 +619,19 @@ export async function editLocal(
     end_at: e,
     duration_minutes: durationMinutes(startMs, endMs),
     quality: patch.quality === undefined ? current.quality : patch.quality,
+    base_version: current.base_version ?? current.version,
     sync_state: 'local',
     conflict_note: null,
     updated_at: new Date().toISOString(),
   };
-  const payload: EditPayload = { session_id: id, client_op_id: newId(), start_at: s, end_at: e, quality: next.quality };
+  const payload: EditPayload = {
+    session_id: id,
+    client_op_id: newId(),
+    base_version: next.base_version ?? next.version,
+    start_at: s,
+    end_at: e,
+    quality: next.quality,
+  };
 
   if (conn !== null) {
     const rows = await queryRows(
@@ -578,7 +649,8 @@ export async function editLocal(
     await transact([
       {
         statement: `UPDATE local_sessions SET start_at = ?, end_at = ?, duration_minutes = ?, quality = ?,
-          sync_state = 'local', conflict_note = NULL, updated_at = ? WHERE id = ?`,
+          base_version = COALESCE(base_version, version), sync_state = 'local',
+          conflict_note = NULL, updated_at = ? WHERE id = ?`,
         values: [next.start_at, next.end_at, next.duration_minutes, next.quality, next.updated_at, id],
       },
       { statement: `DELETE FROM local_ops WHERE kind = 'edit' AND ref_id = ? AND status = 'pending' AND attempts = 0`, values: [id] },
@@ -621,6 +693,7 @@ function toOp(row: Row): QueuedOp {
     status: cellStr(row, 'status') as OpStatus,
     attempts: cellNum(row, 'attempts'),
     last_error: cellStrOrNull(row, 'last_error'),
+    in_flight_since: cellStrOrNull(row, 'in_flight_since'),
   };
 }
 
@@ -634,6 +707,7 @@ function memToOp(row: Row): QueuedOp {
     status: String(row.status ?? 'pending') as OpStatus,
     attempts: Number(row.attempts ?? 0),
     last_error: row.last_error == null ? null : String(row.last_error),
+    in_flight_since: row.in_flight_since == null ? null : String(row.in_flight_since),
   };
 }
 
@@ -648,23 +722,76 @@ export async function nextPendingOp(): Promise<QueuedOp | null> {
   return r ? memToOp(r) : null;
 }
 
+export async function firstFailedOp(): Promise<QueuedOp | null> {
+  if (conn !== null) {
+    const rows = await queryRows(`SELECT * FROM local_ops WHERE status = 'failed' ORDER BY id LIMIT 1`);
+    return rows[0] ? toOp(rows[0]) : null;
+  }
+  nativeGuard();
+  const r = memOps.slice().sort((a, b) => Number(a.id) - Number(b.id)).find((o) => String(o.status) === 'failed');
+  return r ? memToOp(r) : null;
+}
+
+/** 超过 30 秒仍未完成的 in_flight 项恢复为 pending；幂等键保证重试安全。 */
+export async function recoverStaleInFlightOps(): Promise<void> {
+  const cutoff = new Date(Date.now() - 30_000).toISOString();
+  if (conn !== null) {
+    await runSql(
+      `UPDATE local_ops SET status = 'pending', in_flight_since = NULL
+       WHERE status = 'in_flight' AND (in_flight_since IS NULL OR in_flight_since < ?)`,
+      [cutoff],
+    );
+    return;
+  }
+  nativeGuard();
+  for (const o of memOps) {
+    if (String(o.status) === 'in_flight' && (o.in_flight_since == null || String(o.in_flight_since) < cutoff)) {
+      o.status = 'pending';
+      o.in_flight_since = null;
+    }
+  }
+}
+
+export async function markOpInFlight(id: number): Promise<void> {
+  const now = new Date().toISOString();
+  if (conn !== null) {
+    await runSql(
+      `UPDATE local_ops SET status = 'in_flight', in_flight_since = ? WHERE id = ? AND status = 'pending'`,
+      [now, id],
+    );
+    return;
+  }
+  nativeGuard();
+  const o = memOps.find((x) => Number(x.id) === id);
+  if (o !== undefined && String(o.status) === 'pending') {
+    o.status = 'in_flight';
+    o.in_flight_since = now;
+  }
+}
+
 export async function countPendingOps(): Promise<number> {
   if (conn !== null) {
-    const rows = await queryRows(`SELECT COUNT(*) AS n FROM local_ops WHERE status = 'pending'`);
+    const rows = await queryRows(`SELECT COUNT(*) AS n FROM local_ops`);
     return rows[0] ? cellNum(rows[0], 'n') : 0;
   }
   nativeGuard();
-  return memOps.filter((o) => String(o.status) === 'pending').length;
+  return memOps.length;
 }
 
 export async function bumpOpAttempts(id: number, error: string): Promise<void> {
   if (conn !== null) {
-    await runSql(`UPDATE local_ops SET attempts = attempts + 1, last_error = ? WHERE id = ?`, [error, id]);
+    await runSql(
+      `UPDATE local_ops SET status = 'pending', in_flight_since = NULL,
+       attempts = attempts + 1, last_error = ? WHERE id = ?`,
+      [error, id],
+    );
     return;
   }
   nativeGuard();
   const o = memOps.find((x) => Number(x.id) === id);
   if (o !== undefined) {
+    o.status = 'pending';
+    o.in_flight_since = null;
     o.attempts = Number(o.attempts ?? 0) + 1;
     o.last_error = error;
   }
@@ -672,13 +799,18 @@ export async function bumpOpAttempts(id: number, error: string): Promise<void> {
 
 export async function markOpFailed(id: number, error: string): Promise<void> {
   if (conn !== null) {
-    await runSql(`UPDATE local_ops SET status = 'failed', attempts = attempts + 1, last_error = ? WHERE id = ?`, [error, id]);
+    await runSql(
+      `UPDATE local_ops SET status = 'failed', in_flight_since = NULL,
+       attempts = attempts + 1, last_error = ? WHERE id = ?`,
+      [error, id],
+    );
     return;
   }
   nativeGuard();
   const o = memOps.find((x) => Number(x.id) === id);
   if (o !== undefined) {
     o.status = 'failed';
+    o.in_flight_since = null;
     o.attempts = Number(o.attempts ?? 0) + 1;
     o.last_error = error;
   }
@@ -761,9 +893,17 @@ export async function rebindEditOps(fromId: string, toId: string): Promise<void>
  */
 export async function applyServerSession(s: LocalSession, confirmed = false): Promise<void> {
   const existing = await getSession(s.id);
+  const conflictKey = `conflict.${s.id}`;
   if (!confirmed && existing !== null && existing.sync_state === 'local') {
     const note = s.version > existing.version ? `服务器已有更新（v${s.version}），本地修改已保留` : existing.conflict_note;
+    if (s.version > existing.version) {
+      // Keep the authoritative server row so the UI can resolve the conflict
+      // offline, after the failed push has stopped.
+      await setMeta(conflictKey, JSON.stringify(s));
+    }
     if (conn !== null) {
+      // A local edit keeps its own base_version; only the informational
+      // "last confirmed" version advances. The push still uses base_version.
       await runSql(`UPDATE local_sessions SET version = ?, conflict_note = ? WHERE id = ?`, [s.version, note, s.id]);
     } else {
       nativeGuard();
@@ -776,22 +916,35 @@ export async function applyServerSession(s: LocalSession, confirmed = false): Pr
     return;
   }
   const source: SessionSource = existing !== null && existing.source === 'backfill' ? 'backfill' : 'server';
-  const row: LocalSession = { ...s, source, sync_state: 'synced', conflict_note: null };
+  const row: LocalSession = { ...s, source, base_version: null, sync_state: 'synced', conflict_note: null };
   if (conn !== null) {
-    await runSql(
-      `INSERT INTO local_sessions (id, start_at, end_at, duration_minutes, quality, version, source, sync_state, conflict_note, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'synced', NULL, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET start_at = excluded.start_at, end_at = excluded.end_at,
-         duration_minutes = excluded.duration_minutes, quality = excluded.quality, version = excluded.version,
-         sync_state = 'synced', conflict_note = NULL, updated_at = excluded.updated_at`,
-      [row.id, row.start_at, row.end_at, row.duration_minutes, row.quality, row.version, row.source, row.created_at, row.updated_at],
-    );
+    const statements = [
+      {
+        statement: `INSERT INTO local_sessions (id, start_at, end_at, duration_minutes, quality, version, base_version, source, sync_state, conflict_note, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'synced', NULL, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET start_at = excluded.start_at, end_at = excluded.end_at,
+            duration_minutes = excluded.duration_minutes, quality = excluded.quality, version = excluded.version,
+            base_version = NULL, sync_state = 'synced', conflict_note = NULL, updated_at = excluded.updated_at`,
+        values: [row.id, row.start_at, row.end_at, row.duration_minutes, row.quality, row.version, row.source, row.created_at, row.updated_at] as Cell[],
+      },
+    ];
+    if (confirmed) {
+      statements.push(
+        { statement: `DELETE FROM local_ops WHERE kind = 'edit' AND ref_id = ?`, values: [s.id] },
+        { statement: `DELETE FROM meta WHERE key = ?`, values: [conflictKey] },
+      );
+    }
+    await transact(statements);
     return;
   }
   nativeGuard();
   const idx = memSessions.findIndex((x) => String(x.id) === row.id);
   if (idx >= 0) memSessions[idx] = { ...row };
   else memSessions.push({ ...row });
+  if (confirmed) {
+    memOps = memOps.filter((o) => !(String(o.kind) === 'edit' && String(o.ref_id) === s.id));
+    memMeta.delete(conflictKey);
+  }
 }
 
 /**
@@ -809,6 +962,7 @@ export async function replacePairedWithServer(pairedId: string, server: LocalSes
       end_at: paired.end_at,
       duration_minutes: paired.duration_minutes,
       quality: paired.quality,
+      base_version: paired.base_version ?? server.version,
       sync_state: 'local',
       version: server.version,
       updated_at: paired.updated_at,
@@ -819,7 +973,7 @@ export async function replacePairedWithServer(pairedId: string, server: LocalSes
     await rebindEditOps(pairedId, merged.id);
     return;
   }
-  const row: LocalSession = { ...server, source: 'server', sync_state: 'synced', conflict_note: null };
+  const row: LocalSession = { ...server, source: 'server', base_version: null, sync_state: 'synced', conflict_note: null };
   if (conn !== null) {
     await transact([
       { statement: SESSION_INSERT_SQL, values: sessionValues(row) },
@@ -854,11 +1008,11 @@ async function deleteLocalSessionRow(id: string): Promise<void> {
 export async function markSynced(id: string, version: number): Promise<void> {
   const now = new Date().toISOString();
   if (conn !== null) {
-    await runSql(`UPDATE local_sessions SET sync_state = 'synced', conflict_note = NULL, version = ?, updated_at = ? WHERE id = ?`, [
-      version,
-      now,
-      id,
-    ]);
+    await runSql(
+      `UPDATE local_sessions SET sync_state = 'synced', conflict_note = NULL,
+       base_version = NULL, version = ?, updated_at = ? WHERE id = ?`,
+      [version, now, id],
+    );
     return;
   }
   nativeGuard();
@@ -866,6 +1020,7 @@ export async function markSynced(id: string, version: number): Promise<void> {
   if (r !== undefined) {
     r.sync_state = 'synced';
     r.version = version;
+    r.base_version = null;
     r.updated_at = now;
     r.conflict_note = null;
   }
@@ -879,6 +1034,127 @@ export async function setConflictNote(id: string, note: string): Promise<void> {
   nativeGuard();
   const r = memSessions.find((x) => String(x.id) === id);
   if (r !== undefined) r.conflict_note = note;
+}
+
+export interface ConflictRecord {
+  local: LocalSession;
+  server: LocalSession | null;
+}
+
+/** 409 响应携带的权威服务端记录：只记录冲突，不覆盖本地待推送内容。 */
+export async function recordVersionConflict(id: string, server: LocalSession): Promise<void> {
+  const note = `服务器已有更新（v${server.version}），本地修改已保留`;
+  if (conn !== null) {
+    await transact([
+      {
+        statement: `UPDATE local_sessions SET version = ?, conflict_note = ?
+          WHERE id = ? AND sync_state = 'local'`,
+        values: [server.version, note, id],
+      },
+      {
+        statement: `INSERT INTO meta (key, value) VALUES (?, ?)
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        values: [`conflict.${id}`, JSON.stringify(server)],
+      },
+    ]);
+    return;
+  }
+  nativeGuard();
+  const local = memSessions.find((s) => String(s.id) === id);
+  if (local !== undefined && String(local.sync_state) === 'local') {
+    local.version = server.version;
+    local.conflict_note = note;
+  }
+  memMeta.set(`conflict.${id}`, JSON.stringify(server));
+}
+
+export async function conflictFor(id: string): Promise<ConflictRecord | null> {
+  const local = await getSession(id);
+  if (local === null || local.conflict_note === null) return null;
+  const raw = await getMeta(`conflict.${id}`);
+  let server: LocalSession | null = null;
+  if (raw !== null) {
+    try {
+      const parsed = JSON.parse(raw) as Partial<LocalSession>;
+      if (
+        typeof parsed.id === 'string' &&
+        typeof parsed.start_at === 'string' &&
+        typeof parsed.end_at === 'string' &&
+        typeof parsed.duration_minutes === 'number' &&
+        typeof parsed.version === 'number' &&
+        typeof parsed.created_at === 'string' &&
+        typeof parsed.updated_at === 'string'
+      ) {
+        server = {
+          id: parsed.id,
+          start_at: parsed.start_at,
+          end_at: parsed.end_at,
+          duration_minutes: parsed.duration_minutes,
+          quality: typeof parsed.quality === 'number' ? parsed.quality : null,
+          version: parsed.version,
+          base_version: null,
+          source: 'server',
+          sync_state: 'synced',
+          conflict_note: null,
+          created_at: parsed.created_at,
+          updated_at: parsed.updated_at,
+        };
+      }
+    } catch {
+      server = null;
+    }
+  }
+  return { local, server };
+}
+
+/** 用户选择采用服务端版本：丢弃该记录的本地 edit 队列与冲突快照。 */
+export async function resolveConflictWithServer(id: string): Promise<boolean> {
+  const conflict = await conflictFor(id);
+  if (conflict === null || conflict.server === null) return false;
+  await applyServerSession(conflict.server, true);
+  return true;
+}
+
+/** 用户选择保留本地修改：以最新服务端版本为新基准重新排队。 */
+export async function resolveConflictWithLocal(id: string): Promise<boolean> {
+  const conflict = await conflictFor(id);
+  if (conflict === null || conflict.server === null) return false;
+  const local = conflict.local;
+  const server = conflict.server;
+  const payload: EditPayload = {
+    session_id: id,
+    client_op_id: newId(),
+    base_version: server.version,
+    start_at: local.start_at,
+    end_at: local.end_at,
+    quality: local.quality,
+  };
+  const now = new Date().toISOString();
+  if (conn !== null) {
+    await transact([
+      {
+        statement: `UPDATE local_sessions SET version = ?, base_version = ?, sync_state = 'local',
+          conflict_note = NULL, updated_at = ? WHERE id = ?`,
+        values: [server.version, server.version, now, id],
+      },
+      { statement: `DELETE FROM local_ops WHERE kind = 'edit' AND ref_id = ?`, values: [id] },
+      opStmt('edit', id, payload, now),
+      { statement: `DELETE FROM meta WHERE key = ?`, values: [`conflict.${id}`] },
+    ]);
+    return true;
+  }
+  nativeGuard();
+  const row = memSessions.find((s) => String(s.id) === id);
+  if (row === undefined) return false;
+  row.version = server.version;
+  row.base_version = server.version;
+  row.sync_state = 'local';
+  row.conflict_note = null;
+  row.updated_at = now;
+  memOps = memOps.filter((o) => !(String(o.kind) === 'edit' && String(o.ref_id) === id));
+  memOps.push(memOpRow('edit', id, payload, now));
+  memMeta.delete(`conflict.${id}`);
+  return true;
 }
 
 /** 待推送 wake 的原始区间：拉取合并时若正式记录与之重合但 wake 还没推，交给 wake 流程替换，避免重复行。 */
